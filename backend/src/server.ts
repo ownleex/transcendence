@@ -1,0 +1,210 @@
+
+import path from "path";
+import Fastify from "fastify";
+import fastifyMultipart from "@fastify/multipart";
+import fastifyStatic from "@fastify/static";
+import fastifyCors from "@fastify/cors";
+import fastifyJwt from "@fastify/jwt";
+import { FastifyRequest, FastifyReply } from "fastify";
+import http from "http";
+import fs from "fs";
+import dotenv from "dotenv";
+import fastifyCookie from "@fastify/cookie";
+
+import dbPlugin from "./plugins/db";
+import userRoutes from "./routes/user";
+import tournamentRoutes from "./routes/tournament";
+import statsRoutes from "./routes/stats";
+import notificationRoutes from "./routes/notification";
+import { setupGameWS } from "./ws/game";
+import authRoutes from "./routes/auth";
+import { setupSocket } from "./routes/socket";
+
+// -------------------------
+// Load environment variables
+// -------------------------
+dotenv.config();
+
+const certsPath = path.join(__dirname, "../certs");
+
+// ✅ Create Fastify instance with HTTPS
+const fastify = Fastify({
+    logger: true,
+    https: {
+        key: fs.readFileSync(path.join(certsPath, "server.key")),
+        cert: fs.readFileSync(path.join(certsPath, "server.crt")),
+    },
+});
+
+// register cookie plugin (before fastifyOauth2)
+fastify.register(fastifyCookie, {
+  secret: process.env.COOKIE_SECRET || "dev_cookie_secret",
+  parseOptions: {
+    httpOnly: true,
+      //sameSite: "lax",
+      //secure: false, // <-- DEV ONLY
+      sameSite: "none",
+      secure: true,
+    path: "/",
+  },
+});
+
+// -------------------------
+// JWT Setup (before routes)
+// -------------------------
+fastify.register(fastifyJwt, {
+  secret: process.env.JWT_SECRET || "supersecret",
+});
+
+fastify.decorate(
+  "authenticate",
+  async function (request: FastifyRequest, reply: FastifyReply) {
+    try {
+      await request.jwtVerify();
+    } catch {
+      console.log('[ERROR IN THERE]: fastify.decorate')
+      reply.code(401).send({ error: "Unauthorized" });
+    }
+  }
+);
+
+// -------------------------
+// Register plugins
+// -------------------------
+fastify.register(fastifyCors, { origin: "*" });
+fastify.register(dbPlugin);
+fastify.register(fastifyMultipart);
+
+// -------------------------
+// WebSocket Setup (combined)
+// -------------------------
+//setupSocket(fastify);
+//setupGameWS(fastify);
+fastify.register(setupSocket);
+fastify.register(setupGameWS);
+
+// -------------------------
+// API Routes
+// -------------------------
+fastify.register(authRoutes);
+fastify.register(userRoutes, { prefix: "/api/user" });
+fastify.register(tournamentRoutes, { prefix: "/api" });
+fastify.register(statsRoutes, { prefix: "/api/stats" });
+fastify.register(notificationRoutes, { prefix: "/api/notifications" });
+
+// -------------------------
+// Example DB endpoints
+// -------------------------
+fastify.get("/api/tables", async (request: FastifyRequest, reply: FastifyReply) => {
+    const db = fastify.db;
+    const rows: { name: string }[] = await db.all(`
+    SELECT name FROM sqlite_master
+    WHERE type='table' AND name NOT LIKE 'sqlite_%'
+  `);
+    return rows.map((r) => r.name);
+});
+
+fastify.get<{ Params: { name: string } }>("/api/table/:name", async (request, reply) => {
+    const db = fastify.db;
+    const table = request.params.name;
+
+    if (!/^[A-Za-z0-9_]+$/.test(table)) {
+        reply.code(400).send({ error: "Invalid table name" });
+        return;
+    }
+
+    try {
+        const rows = await db.all(`SELECT * FROM "${table}" LIMIT 10`);
+        return rows;
+    } catch (err: any) {
+        reply.code(500).send({ error: err.message });
+    }
+});
+
+// -------------------------
+// Static frontend & uploads
+// -------------------------
+function resolveUploadsPath(): string {
+    // try relative to compiled file (src/dist)
+    let candidate = path.join(__dirname, '..', 'uploads');
+    if (fs.existsSync(candidate)) return candidate;
+
+    // fallback to project cwd
+    candidate = path.join(process.cwd(), 'backend', 'uploads');
+    if (fs.existsSync(candidate)) return candidate;
+
+    // last-resort: create it under cwd/backend/uploads
+    candidate = path.join(process.cwd(), 'backend', 'uploads');
+    fs.mkdirSync(candidate, { recursive: true });
+    return candidate;
+}
+
+// call this early, BEFORE registering frontend static
+const uploadsPath = resolveUploadsPath();
+const frontendPath = path.join(__dirname, 'frontend');
+
+console.log('DEBUG: uploadsPath =', uploadsPath);
+console.log('DEBUG: default exists =', fs.existsSync(path.join(uploadsPath, 'default.png')));
+
+// register uploads static FIRST (if not already registered)
+fastify.register(fastifyStatic, {
+    root: uploadsPath,
+    prefix: '/uploads/',
+    list: false,
+    decorateReply: false,
+});
+// Serve built frontend
+fastify.register(fastifyStatic, {
+    root: frontendPath,
+    prefix: "/",
+    index: "index.html",
+});
+
+// SPA fallback (after static)
+fastify.setNotFoundHandler((req, reply) => {
+    const url = req.url || "";
+    if (req.url.startsWith("/api") || req.url.startsWith("/uploads")) {
+        return reply.code(404).send({ error: "Not found" });
+    }
+
+    const indexPath = path.join(frontendPath, "index.html");
+    if (fs.existsSync(indexPath)) {
+        return reply.type("text/html").send(fs.readFileSync(indexPath));
+    }
+    reply.code(404).send({ error: "Frontend not found" });
+});
+
+// -------------------------
+// Start server
+// -------------------------
+const start = async () => {
+    try {
+        await fastify.listen({
+            port: 3000,
+            host: "::",      // enables IPv4 + IPv6
+            ipv6Only: false, // dual stack mode
+        });
+        console.log("🚀 Server running on:");
+        console.log("   https://<IPv4>:3000");
+        console.log("   https://[<IPv6>]:3000");
+    } catch (err) {
+        fastify.log.error(err);
+        process.exit(1);
+    }
+};
+
+start();
+
+/*
+const start = async () => {
+    try {
+        await fastify.listen({ port: 3000, host: "0.0.0.0" });
+        console.log("🚀 Transcendence running at https://localhost:3000");
+    } catch (err) {
+        fastify.log.error(err);
+        process.exit(1);
+    }
+};
+
+start();
+*/
